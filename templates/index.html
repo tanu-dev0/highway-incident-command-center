@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Highway Command Center</title>
+
+<!-- Leaflet (map) and Socket.IO client, loaded from CDNs -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  /* ---- Design tokens ------------------------------------------------------
+     Palette borrows from Indian highway signage: NH-blue plates, white text,
+     and a single hazard red reserved for incidents. */
+  :root {
+    --bg:        #0d1b2a;   /* night-asphalt blue */
+    --panel:     #13283d;
+    --panel-2:   #19344d;
+    --line:      #274763;
+    --text:      #e8f0f7;
+    --muted:     #8da5bb;
+    --nh-blue:   #0b5fa5;   /* NH signage blue */
+    --ok:        #3fbf8a;
+    --alert:     #ff3b30;   /* hazard red: incidents only */
+    --car:       #f5a742;
+    --truck:     #4aa3ff;
+    --bus:       #5fd48a;
+    --sans:      "Barlow", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --display:   "Barlow Condensed", "Arial Narrow", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    display: grid; grid-template-rows: auto 1fr; font-size: 15px;
+  }
+
+  /* ---- Header ---- */
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 10px 18px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .plate {
+    font-family: var(--display); font-weight: 700; font-size: 22px; letter-spacing: .5px;
+    background: var(--nh-blue); color: #fff; padding: 2px 12px; border-radius: 6px;
+    border: 2px solid #fff;
+  }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  .status {
+    display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted);
+  }
+  .status i { width: 9px; height: 9px; border-radius: 50%; background: var(--alert); display: inline-block; }
+  .status.live i { background: var(--ok); }
+  .status.live span::after { content: "Live"; }
+  .status:not(.live) span::after { content: "Disconnected"; }
+
+  /* ---- Main layout: map on the left, sidebar on the right ---- */
+  main { display: grid; grid-template-columns: 1fr 380px; min-height: 0; }
+  #map { height: 100%; min-height: 320px; background: #0a1520; }
+  /* Darken the stock OSM tiles so markers stand out (tiles only, not markers). */
+  .leaflet-tile-pane { filter: invert(1) hue-rotate(185deg) brightness(.85) contrast(.9) saturate(.7); }
+
+  aside {
+    display: flex; flex-direction: column; gap: 14px; padding: 14px; min-height: 0;
+    background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto;
+  }
+
+  /* ---- Traffic counter panel ---- */
+  .counters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .counter {
+    background: var(--panel-2); border: 1px solid var(--line); border-top: 4px solid var(--c);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .counter .label { color: var(--muted); font-size: 13px; }
+  .counter .value { font-family: var(--display); font-weight: 600; font-size: 44px; line-height: 1; font-variant-numeric: tabular-nums; }
+  .counter .total { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .counter.bump .value { animation: bump .35s ease-out; }
+  @keyframes bump { 0% { transform: scale(1.18); } 100% { transform: scale(1); } }
+
+  .incident-state {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel-2);
+  }
+  .incident-state .name { font-weight: 600; }
+  .incident-state .hint { color: var(--muted); font-size: 13px; }
+  .incident-state.alert { border-color: var(--alert); background: rgba(255, 59, 48, .14); }
+  .incident-state .n { font-family: var(--display); font-size: 34px; font-weight: 700; }
+  .incident-state.alert .n { color: var(--alert); }
+
+  /* ---- Annotated camera feed ---- */
+  .feed { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #000; }
+  .feed img { display: block; width: 100%; height: auto; min-height: 120px; }
+  .feed figcaption { padding: 6px 10px; font-size: 12px; color: var(--muted); background: var(--panel-2); }
+  .feed { margin: 0; }
+
+  /* ---- Event log ---- */
+  .log-head { font-weight: 600; display: flex; justify-content: space-between; }
+  .log-head small { color: var(--muted); font-weight: 400; }
+  #log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; min-height: 120px; }
+  #log li {
+    border-left: 4px solid var(--line); background: var(--panel-2); border-radius: 4px;
+    padding: 7px 10px; font-size: 13px; line-height: 1.35;
+  }
+  #log li.alert { border-left-color: var(--alert); cursor: pointer; }
+  #log li.clear { border-left-color: var(--ok); }
+  #log li.info  { border-left-color: var(--truck); }
+  #log time { color: var(--muted); font-size: 12px; display: block; }
+  #log li.empty { color: var(--muted); border-left-color: transparent; background: none; }
+
+  /* ---- Pulsing incident marker (Leaflet divIcon) ---- */
+  .pulse { position: relative; width: 22px; height: 22px; }
+  .pulse .core {
+    position: absolute; inset: 4px; border-radius: 50%; background: var(--alert);
+    border: 2px solid #fff; box-shadow: 0 0 8px rgba(255, 59, 48, .9);
+  }
+  .pulse .ring {
+    position: absolute; inset: 0; border-radius: 50%; border: 3px solid var(--alert);
+    animation: ping 1.6s ease-out infinite;
+  }
+  .pulse .ring.r2 { animation-delay: .8s; }
+  @keyframes ping { 0% { transform: scale(.6); opacity: 1; } 100% { transform: scale(3.2); opacity: 0; } }
+
+  .cam-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--nh-blue); border: 3px solid #fff; }
+
+  .leaflet-popup-content-wrapper { background: var(--panel); color: var(--text); }
+  .leaflet-popup-tip { background: var(--panel); }
+  .leaflet-popup-content { font-family: var(--sans); font-size: 13px; line-height: 1.5; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pulse .ring, .counter.bump .value { animation: none; }
+  }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 45vh auto; }
+    aside { border-left: none; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+
+<body>
+<header>
+  <span class="plate" id="plate">NH 44</span>
+  <div>
+    <h1>Highway Incident Command Center</h1>
+    <div class="sub" id="highway-name">Waiting for the first update</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="status" id="status"><i></i><span></span></div>
+</header>
+
+<main>
+  <div id="map" role="application" aria-label="Highway incident map"></div>
+
+  <aside>
+    <section aria-label="Traffic counters">
+      <div class="counters">
+        <div class="counter" id="c-car"   style="--c: var(--car)">
+          <div class="label">Cars</div><div class="value">0</div><div class="total">0 since start</div>
+        </div>
+        <div class="counter" id="c-truck" style="--c: var(--truck)">
+          <div class="label">Trucks</div><div class="value">0</div><div class="total">0 since start</div>
+        </div>
+        <div class="counter" id="c-bus"   style="--c: var(--bus)">
+          <div class="label">Buses</div><div class="value">0</div><div class="total">0 since start</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="incident-state" id="incident-state" aria-live="polite">
+      <div>
+        <div class="name" id="incident-name">No active incidents</div>
+        <div class="hint" id="incident-hint">Traffic is flowing in the monitored lanes.</div>
+      </div>
+      <div class="n" id="incident-count">0</div>
+    </section>
+
+    <figure class="feed">
+      <img src="/video_feed" alt="Annotated camera feed with the lane region outlined">
+      <figcaption>Camera feed with detections. Highlighted area is the monitored lanes.</figcaption>
+    </figure>
+
+    <section style="display:flex; flex-direction:column; gap:8px; min-height:0;">
+      <div class="log-head">Event log <small>newest first</small></div>
+      <ul id="log"><li class="empty">No events yet.</li></ul>
+    </section>
+  </aside>
+</main>
+
+<script>
+/* ============================================================================
+   Map setup
+   ========================================================================== */
+const map = L.map('map', { zoomControl: true }).setView([28.99, 77.02], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+
+const incidentMarkers = {};   // incident id -> L.marker
+const incidentData = {};      // incident id -> incident object (for log clicks)
+let mapReady = false;
+
+/* The pulsing red pin: a divIcon whose rings are animated in CSS. */
+const pulseIcon = L.divIcon({
+  className: '',
+  html: '<div class="pulse"><span class="ring"></span><span class="ring r2"></span><span class="core"></span></div>',
+  iconSize: [22, 22], iconAnchor: [11, 11], popupAnchor: [0, -12]
+});
+
+/* ============================================================================
+   Helpers
+   ========================================================================== */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour12: false });
+
+function setCounter(cls, current, total) {
+  const el = $('c-' + cls), val = el.querySelector('.value');
+  if (String(current) !== val.textContent) {
+    val.textContent = current;
+    el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');  // restart animation
+  }
+  el.querySelector('.total').textContent = total + ' since start';
+}
+
+function renderCounts(p) {
+  ['car', 'truck', 'bus'].forEach(c => setCounter(c, p.counts[c] ?? 0, p.totals[c] ?? 0));
+  const n = (p.active_incidents || []).length;
+  $('incident-count').textContent = n;
+  $('incident-state').classList.toggle('alert', n > 0);
+  $('incident-name').textContent = p.incident ? p.incident : 'No active incidents';
+  $('incident-hint').textContent = n > 0
+    ? n + (n === 1 ? ' vehicle is' : ' vehicles are') + ' stopped in the monitored lanes.'
+    : 'Traffic is flowing in the monitored lanes.';
+}
+
+function logEvent(kind, html, ts, incId) {
+  const ul = $('log');
+  const empty = ul.querySelector('.empty'); if (empty) empty.remove();
+  const li = document.createElement('li');
+  li.className = kind;
+  li.innerHTML = '<time>' + esc(clock(ts)) + '</time>' + html;
+  if (incId) li.addEventListener('click', () => focusIncident(incId));
+  ul.prepend(li);
+  while (ul.children.length > 50) ul.lastChild.remove();   // keep the log bounded
+}
+
+function popupHtml(inc) {
+  return '<b>' + esc(inc.type) + '</b> (' + esc(inc.id) + ')<br>' +
+         'Vehicle: ' + esc(inc.vehicle_class) + ' #' + esc(inc.track_id) + '<br>' +
+         'Position: ' + inc.lat.toFixed(5) + ', ' + inc.lon.toFixed(5) + '<br>' +
+         'Detected: ' + esc(clock(inc.detected_at));
+}
+
+function addIncident(inc, fly) {
+  if (incidentMarkers[inc.id]) return;
+  incidentData[inc.id] = inc;
+  incidentMarkers[inc.id] = L.marker([inc.lat, inc.lon], { icon: pulseIcon, title: inc.type })
+    .addTo(map).bindPopup(popupHtml(inc));
+  if (fly) { map.flyTo([inc.lat, inc.lon], 15, { duration: 1.2 }); incidentMarkers[inc.id].openPopup(); }
+}
+
+function removeIncident(id) {
+  if (incidentMarkers[id]) { map.removeLayer(incidentMarkers[id]); delete incidentMarkers[id]; }
+  delete incidentData[id];
+}
+
+function focusIncident(id) {
+  const m = incidentMarkers[id];
+  if (m) { map.flyTo(m.getLatLng(), 16, { duration: .8 }); m.openPopup(); }
+}
+
+/* ============================================================================
+   Socket.IO: live updates from app.py
+   ========================================================================== */
+const socket = io();
+
+socket.on('connect',    () => { $('status').classList.add('live');    logEvent('info', 'Connected to command center', new Date().toISOString()); });
+socket.on('disconnect', () => { $('status').classList.remove('live'); logEvent('info', 'Connection lost. Retrying...', new Date().toISOString()); });
+
+/* Sent once per connection: highway geometry + whatever is happening right now. */
+socket.on('state_sync', (s) => {
+  $('highway-name').textContent = s.highway;
+  if (!mapReady) {
+    const road = L.polyline(s.path, { color: '#f5a742', weight: 5, opacity: .85 }).addTo(map);
+    L.marker([s.camera.lat, s.camera.lon], {
+      icon: L.divIcon({ className: '', html: '<div class="cam-dot"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }),
+      title: 'Camera'
+    }).addTo(map).bindTooltip('Camera', { direction: 'top' });
+    map.fitBounds(road.getBounds(), { padding: [30, 30] });
+    mapReady = true;
+  }
+  if (s.payload) {
+    renderCounts(s.payload);
+    s.payload.active_incidents.forEach(inc => addIncident(inc, false));
+  }
+});
+
+/* ~2 Hz: live vehicle counts + active incident summary. */
+socket.on('traffic_update', renderCounts);
+
+/* A vehicle has been stationary in the ROI for longer than the threshold. */
+socket.on('incident_alert', (p) => {
+  const inc = p.alert;
+  addIncident(inc, true);
+  logEvent('alert',
+    '<b>' + esc(inc.type) + '</b>: ' + esc(inc.vehicle_class) + ' #' + esc(inc.track_id) +
+    '<br>' + inc.lat.toFixed(5) + ', ' + inc.lon.toFixed(5), p.timestamp, inc.id);
+});
+
+/* The vehicle moved again (or left the lanes). */
+socket.on('incident_cleared', (p) => {
+  const inc = p.incident;
+  removeIncident(inc.id);
+  logEvent('clear', '<b>Cleared</b>: ' + esc(inc.id) + ' (' + esc(inc.vehicle_class) + ' #' + esc(inc.track_id) + ')', p.timestamp);
+});
+
+/* The sample video looped, so the server reset its state. */
+socket.on('incidents_reset', () => Object.keys(incidentMarkers).forEach(removeIncident));
+</script>
+</body>
+</html>
